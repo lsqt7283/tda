@@ -1,0 +1,80 @@
+{
+  "observations": 547,
+  "assets": 161,
+  "config": {
+    "config_path": "\\\\LSFS\\BOSTON\\Dept\\FIM\\HF2\\PY\\EM Model\\NLP\\TDA\\tda_config.yaml",
+    "transfer_entropy": {
+      "window_size": 40,
+      "step": 1,
+      "history": 1,
+      "bins": 12
+    },
+    "tda": {
+      "window_size": 25,
+      "step": 5
+    }
+  },
+  "transfer_entropy": {
+    "snapshots": 508,
+    "statistics": {
+      "mean": 1.3270145383441059,
+      "max": 1.7958743594181472,
+      "min": 0.4203242619270935
+    },
+    "top_pairs": [
+      "002716 CH Equity <-> 9988 HK Equity: 1.4581",
+      "600862 CH Equity <-> 9988 HK Equity: 1.4455",
+      "002179 CH Equity <-> 9988 HK Equity: 1.4448",
+      "9988 HK Equity <-> 002085 CH Equity: 1.4396",
+      "9988 HK Equity <-> 000423 CH Equity: 1.4384"
+    ]
+  },
+  "tda_window": {
+    "count": 97
+  },
+  "output_files": [
+    "persistent_diagrams_full.png",
+    "persistent_barcodes_full.png",
+    "persistent_diagrams_window_001.png",
+    "persistent_diagrams_window_049.png",
+    "persistent_diagrams_window_097.png",
+    "persistent_barcodes_window_001.png",
+    "persistent_barcodes_window_049.png",
+    "persistent_barcodes_window_097.png",
+    "transfer_entropy_snapshots.csv",
+    "bottleneck_distance.png",
+    "betti_numbers.png",
+    "tda_metrics.csv",
+    "tda_summary.md",
+    "mapper_graph.html"
+  ],
+  "mapper": {
+    "enabled": true,
+    "note": "exported to mapper_graph.html (144 nodes)",
+    "result": {
+      "nodes": 144,
+      "edges": 136,
+      "lens_components": 2,
+      "intervals": 12,
+      "intervals_requested": [
+        12,
+        12
+      ],
+      "overlap": 0.35,
+      "dbscan_eps": 0.5,
+      "dbscan_min_samples": 3,
+      "layout_dim": 2,
+      "layout_iterations": 75,
+      "layout_seed": 42,
+      "output": "mapper_graph.html",
+      "plot_backend": "plotly",
+      "plot_backend_error": null,
+      "cover_fallback": "scalar_intervals",
+      "cluster_strategy": {
+        "algorithm": "AgglomerativeClustering",
+        "n_clusters": 8
+      }
+    },
+    "output_html": "mapper_graph.html"
+  }
+}

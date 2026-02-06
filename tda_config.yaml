@@ -1,0 +1,13 @@
+data:
+  returns_file: returns.xlsx
+  te_snapshot_csv: transfer_entropy_snapshots.csv
+
+transfer_entropy:
+  window_size: 40         # trading days per snapshot
+  step: 1                 # sampling stride in trading days
+  history: 1              # number of lags for TE estimation
+  bins: 12                # discretization bins for TE
+
+tda:
+  window_size: 25         # number of TE snapshots per TDA window
+  step: 5                 # stride between TDA windows
