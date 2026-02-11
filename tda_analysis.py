@@ -1,7 +1,8 @@
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,6 +11,10 @@ from persim import bottleneck, plot_diagrams
 from ripser import ripser
 from sklearn.cluster import AgglomerativeClustering, DBSCAN
 from sklearn.decomposition import PCA
+
+from point_clouds import PointCloudResult
+from pca_point_cloud import create_pca_point_cloud
+from transfer_entropy_point_cloud import create_transfer_entropy_point_cloud
 
 try:
     import yaml
@@ -66,116 +71,6 @@ def progress_iter(iterable: Iterable, total: Optional[int] = None, desc: str = "
                 print(f"{prefix}{count}")
 
     return generator()
-
-
-def load_te_snapshots(csv_path: Path, assets: List[str]) -> List[Dict[str, object]]:
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"Transfer entropy snapshot CSV not found at {csv_path}. Run transfer_entropy_pipeline.py first."
-        )
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        raise ValueError("Transfer entropy snapshot CSV is empty; nothing to analyse.")
-
-    asset_index = {asset: idx for idx, asset in enumerate(assets)}
-    snapshots: List[Dict[str, object]] = []
-    for idx, group in df.groupby("snapshot_index"):
-        matrix = np.zeros((len(assets), len(assets)), dtype=float)
-        for row in group.itertuples(index=False):
-            try:
-                i = asset_index[row.asset_i]
-                j = asset_index[row.asset_j]
-            except KeyError as exc:
-                raise KeyError(
-                    f"Asset '{row.asset_i}' or '{row.asset_j}' in TE CSV not found in returns dataset."
-                ) from exc
-            value = float(row.transfer_entropy)
-            if value <= 0.0:
-                continue
-            matrix[i, j] = matrix[j, i] = value
-        start_date = pd.to_datetime(group["start_date"].iloc[0])
-        end_date = pd.to_datetime(group["end_date"].iloc[0])
-        snapshots.append(
-            {
-                "index": int(idx),
-                "start": start_date,
-                "end": end_date,
-                "matrix": matrix,
-            }
-        )
-    snapshots.sort(key=lambda snap: snap["index"])
-    return snapshots
-
-
-def build_asset_embedding(snapshots: List[Dict[str, object]]) -> np.ndarray:
-    if not snapshots:
-        raise ValueError("At least one transfer entropy snapshot is required for embedding.")
-
-    matrices = [snap["matrix"] for snap in snapshots]
-    n_assets = matrices[0].shape[0]
-    for matrix in matrices:
-        if matrix.shape[0] != n_assets:
-            raise ValueError("All transfer entropy matrices must share the same asset dimension.")
-
-    feature_columns: List[np.ndarray] = []
-    for matrix in matrices:
-        if matrix.shape[1] <= 1:
-            averages = np.zeros(n_assets, dtype=float)
-        else:
-            positive_mask = matrix > 0.0
-            row_sums = (matrix * positive_mask).sum(axis=1)
-            counts = positive_mask.sum(axis=1)
-            denom = np.where(counts > 0, counts, 1)
-            averages = row_sums / denom
-        feature_columns.append(averages)
-
-    embedding = np.column_stack(feature_columns)
-    embedding = embedding - embedding.mean(axis=0, keepdims=True)
-    std = embedding.std(axis=0, keepdims=True)
-    std[std == 0] = 1.0
-    return embedding / std
-
-
-def summarize_transfer_entropy_snapshots(
-    snapshots: List[Dict[str, object]],
-    assets: List[str],
-    top_n: int = 5,
-) -> Tuple[Dict[str, float], List[str]]:
-    if not snapshots:
-        return {
-            "mean": float("nan"),
-            "max": float("nan"),
-            "min": float("nan"),
-        }, []
-
-    paired_values: Dict[Tuple[str, str], List[float]] = {}
-    all_values: List[float] = []
-    for snap in snapshots:
-        matrix = snap["matrix"]
-        upper_i, upper_j = np.triu_indices(len(assets), k=1)
-        for i_idx, j_idx, value in zip(upper_i, upper_j, matrix[upper_i, upper_j]):
-            if value <= 0.0:
-                continue
-            value = float(value)
-            all_values.append(value)
-            key = (assets[i_idx], assets[j_idx])
-            paired_values.setdefault(key, []).append(value)
-
-    values_array = np.asarray(all_values, dtype=float)
-    summary = {
-        "mean": float(np.nanmean(values_array)) if values_array.size else float("nan"),
-        "max": float(np.nanmax(values_array)) if values_array.size else float("nan"),
-        "min": float(np.nanmin(values_array)) if values_array.size else float("nan"),
-    }
-
-    averaged_pairs = [
-        (pair, float(np.nanmean(vals)))
-        for pair, vals in paired_values.items()
-        if vals
-    ]
-    averaged_pairs.sort(key=lambda item: item[1], reverse=True)
-    formatted_pairs = [f"{a} <-> {b}: {value:.4f}" for (a, b), value in averaged_pairs[:top_n]]
-    return summary, formatted_pairs
 
 
 def compute_diagrams(point_cloud: np.ndarray, maxdim: int = 1) -> List[np.ndarray]:
@@ -257,33 +152,155 @@ def save_barcode_plot(diagrams: List[np.ndarray], title: str, output_path: Path)
     plt.close(fig)
 
 
-def rolling_indices(length: int, window_size: int, step: int) -> List[Tuple[int, int]]:
-    windows: List[Tuple[int, int]] = []
-    for start in range(0, length - window_size + 1, step):
-        end = start + window_size
-        windows.append((start, end))
-    return windows
+def save_diagram_and_barcode(
+    diagrams: List[np.ndarray],
+    title: str,
+    output_path: Path,
+) -> None:
+    dims = len(diagrams)
+    if dims == 0:
+        raise ValueError("At least one diagram is required for plotting.")
+
+    fig, axes = plt.subplots(dims, 2, figsize=(12, max(3, 3.5 * dims)))
+    if dims == 1:
+        axes = np.array([axes])  # type: ignore[assignment]
+
+    max_limit = 0.0
+    for diagram in diagrams:
+        finite = finite_diagram(diagram)
+        if finite.size:
+            max_limit = max(max_limit, float(np.max(finite)))
+
+    if max_limit == 0:
+        max_limit = 1.0
+
+    for dim, (diagram, row_axes) in enumerate(zip(diagrams, axes)):
+        diag_ax, bar_ax = row_axes
+        plot_diagrams([diagram], show=False, ax=diag_ax)
+        diag_ax.set_title(f"H{dim} Persistence Diagram")
+        diag_ax.set_xlim(0, max_limit * 1.05)
+        diag_ax.set_ylim(0, max_limit * 1.05)
+        diag_ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4)
+
+        finite = finite_diagram(diagram)
+        if finite.size == 0:
+            bar_ax.text(0.5, 0.5, "No finite features", ha="center", va="center", fontsize=10)
+            bar_ax.set_ylim(-0.5, 0.5)
+        else:
+            for idx, (birth, death) in enumerate(sorted(finite, key=lambda pair: pair[0])):
+                bar_ax.hlines(idx, birth, death, colors="tab:blue", linewidth=2)
+            bar_ax.set_ylim(-0.5, len(finite) - 0.5)
+            bar_ax.set_xlim(0, max_limit * 1.05)
+        bar_ax.set_title(f"H{dim} Barcode")
+        bar_ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4)
+        if dim == dims - 1:
+            bar_ax.set_xlabel("Filtration value")
+        bar_ax.set_ylabel("Feature")
+
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def persistent_entropy(diagram: np.ndarray) -> float:
+    finite = finite_diagram(diagram)
+    if finite.size == 0:
+        return 0.0
+    lifetimes = finite[:, 1] - finite[:, 0]
+    lifetimes = lifetimes[lifetimes > 0]
+    if lifetimes.size == 0:
+        return 0.0
+    total = float(np.sum(lifetimes))
+    if total <= 0:
+        return 0.0
+    probs = lifetimes / total
+    entropy = float(-np.sum(probs * np.log(probs)))
+    return entropy
+
+
+def euler_characteristic(betti_numbers: Dict[int, int]) -> int:
+    return int(sum(((-1) ** dim) * count for dim, count in betti_numbers.items()))
 
 
 def save_line_chart(
-    x_values: List[pd.Timestamp],
+    x_values: Sequence[object],
     series_map: Dict[str, List[float]],
     title: str,
     ylabel: str,
     output_path: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 4))
+    if not x_values:
+        raise ValueError("At least one x value is required for line chart plotting.")
+
+    first_val = x_values[0]
+    is_datetime = isinstance(first_val, pd.Timestamp)
+    if is_datetime:
+        x_axis = list(x_values)
+    else:
+        x_axis = list(range(len(x_values)))
+
     for label, values in series_map.items():
-        ax.plot(x_values, values, marker="o", label=label)
+        ax.plot(x_axis, values, marker="o", label=label)
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     if len(series_map) > 1:
         ax.legend()
-    fig.autofmt_xdate()
+    if is_datetime:
+        ax.set_xticks(x_axis)
+        ax.set_xticklabels([pd.Timestamp(x).date() for x in x_values], rotation=45, ha="right")
+    else:
+        ax.set_xticks(x_axis)
+        ax.set_xticklabels([str(x) for x in x_values], rotation=45, ha="right")
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+def prepare_axis(values: List[object]) -> List[object]:
+    if not values:
+        return []
+    if all(isinstance(val, pd.Timestamp) for val in values):
+        return list(values)
+    return [str(val) for val in values]
+
+
+def build_point_cloud(
+    base_dir: Path,
+    config: Dict[str, object],
+    returns: pd.DataFrame,
+    te_csv_override: Optional[Path] = None,
+) -> PointCloudResult:
+    point_cfg = config.get("point_cloud", {}) or {}
+    method = str(point_cfg.get("method", "transfer_entropy")).lower()
+
+    if method == "transfer_entropy":
+        data_cfg = config.get("data", {}) or {}
+        te_cfg = config.get("transfer_entropy", {}) or {}
+        tda_cfg = config.get("tda", {}) or {}
+        return create_transfer_entropy_point_cloud(
+            base_dir=base_dir,
+            returns=returns,
+            data_cfg=data_cfg,
+            te_cfg=te_cfg,
+            tda_cfg=tda_cfg,
+            te_csv_override=te_csv_override,
+        )
+    if method == "pca":
+        pca_cfg = config.get("pca", {}) or {}
+        return create_pca_point_cloud(
+            base_dir=base_dir,
+            returns=returns,
+            pca_cfg=pca_cfg,
+        )
+
+    available = ["transfer_entropy", "pca"]
+    raise ValueError(
+        "Unknown point cloud method '"
+        f"{method}' specified. Supported methods: {', '.join(available)}."
+    )
 
 
 def create_mapper_visualization(
@@ -461,44 +478,37 @@ def create_mapper_visualization(
 
 def write_summary(
     output_path: Path,
+    *,
     observations: int,
     assets: int,
-    te_window_size: int,
-    te_step: int,
-    te_snapshots: int,
-    tda_window_size: int,
-    tda_window_step: int,
-    tda_windows: int,
-    te_history: int,
-    te_bins: int,
-    te_stats: Dict[str, float],
-    te_top_pairs: List[str],
+    point_cloud_method: str,
+    point_cloud_summary: List[str],
+    tda_config: Dict[str, int],
+    tda_window_count: int,
     bn_stats: Dict[str, float],
     betti_stats: Dict[int, Dict[str, float]],
+    euler_stats: Optional[Dict[str, float]],
+    entropy_stats: Dict[int, Dict[str, float]],
     mapper_note: Optional[str] = None,
 ) -> None:
     lines = [
         "# Topological Data Analysis Summary",
         f"- Observations processed: {observations}",
         f"- Assets included: {assets}",
-        f"- Transfer entropy window (trading days): {te_window_size}",
-        f"- Transfer entropy sampling step (days): {te_step}",
-        f"- Transfer entropy snapshots ingested: {te_snapshots}",
-        f"- TDA window size (snapshots): {tda_window_size}",
-        f"- TDA window step (snapshots): {tda_window_step}",
-        f"- TDA windows evaluated: {tda_windows}",
-        f"- Transfer entropy history length (k): {te_history}",
-        f"- Transfer entropy discretization bins: {te_bins}",
+        f"- Point cloud method: {point_cloud_method}",
+        f"- TDA window size: {tda_config.get('window_size', 'n/a')}",
+        f"- TDA window step: {tda_config.get('step', 'n/a')}",
+        f"- TDA windows evaluated: {tda_window_count}",
     ]
-    if not np.isnan(te_stats.get("mean", float("nan"))):
-        lines.append(
-            "- Symmetric transfer entropy (global): "
-            f"mean {te_stats['mean']:.4f}, max {te_stats['max']:.4f}, min {te_stats['min']:.4f}"
-        )
-    if te_top_pairs:
-        lines.append("- Strongest average TE pairs:")
-        for entry in te_top_pairs:
-            lines.append(f"  - {entry}")
+
+    if point_cloud_summary:
+        lines.append("- Point cloud details:")
+        for entry in point_cloud_summary:
+            if entry.startswith("  "):
+                lines.append(entry)
+            else:
+                lines.append(f"  {entry}")
+
     if np.isnan(bn_stats.get("mean", float("nan"))):
         lines.append("- Rolling bottleneck distance (H1): not available")
     else:
@@ -506,6 +516,7 @@ def write_summary(
             "- Rolling bottleneck distance (H1): "
             f"mean {bn_stats['mean']:.4f}, max {bn_stats['max']:.4f}, min {bn_stats['min']:.4f}"
         )
+
     for dim, stats in sorted(betti_stats.items()):
         if any(np.isnan(val) for val in stats.values()):
             lines.append(f"- Betti numbers (H{dim}): not available")
@@ -514,8 +525,26 @@ def write_summary(
                 f"- Betti numbers (H{dim}): mean {stats['mean']:.2f}, "
                 f"max {int(stats['max'])}, min {int(stats['min'])}"
             )
+
+    if euler_stats:
+        lines.append(
+            "- Euler characteristic: "
+            f"mean {euler_stats['mean']:.2f}, max {euler_stats['max']:.2f}, min {euler_stats['min']:.2f}"
+        )
+
+    if entropy_stats:
+        lines.append("- Persistent entropy:")
+        for dim, stats in sorted(entropy_stats.items()):
+            if any(np.isnan(val) for val in stats.values()):
+                lines.append(f"  H{dim}: not available")
+            else:
+                lines.append(
+                    f"  H{dim}: mean {stats['mean']:.4f}, max {stats['max']:.4f}, min {stats['min']:.4f}"
+                )
+
     if mapper_note:
         lines.append(f"- Mapper visualisation: {mapper_note}")
+
     lines.append(
         "\nBetti numbers represent the count of topological features (components, loops, etc.) "
         "detected within each rolling window's persistent homology diagrams."
@@ -545,36 +574,20 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     config = load_config(args.config)
 
-    data_cfg = config.get("data", {})
-    te_cfg = config.get("transfer_entropy", {})
-    tda_cfg = config.get("tda", {})
-    mapper_cfg = config.get("mapper", {})
+    data_cfg = config.get("data", {}) or {}
+    tda_cfg = config.get("tda", {}) or {}
+    mapper_cfg = config.get("mapper", {}) or {}
 
     returns_path = base_dir / data_cfg.get("returns_file", "returns.xlsx")
-    te_csv_path = (
-        Path(args.te_csv)
-        if args.te_csv
-        else base_dir / data_cfg.get("te_snapshot_csv", "transfer_entropy_snapshots.csv")
-    )
-
     df = load_returns(returns_path)
-    assets = list(df.columns)
-    te_snapshots = load_te_snapshots(te_csv_path, assets)
-    te_stats, te_top_pairs = summarize_transfer_entropy_snapshots(te_snapshots, assets)
 
-    te_window_size = int(te_cfg.get("window_size", 40))
-    te_step = int(te_cfg.get("step", 1))
-    te_history = int(te_cfg.get("history", 1))
-    te_bins = int(te_cfg.get("bins", 12))
-    tda_window_size = int(tda_cfg.get("window_size", 25))
-    tda_window_step = int(tda_cfg.get("step", 5))
+    te_csv_override = Path(args.te_csv) if args.te_csv else None
+    point_cloud = build_point_cloud(base_dir, config, df, te_csv_override)
 
-    if len(te_snapshots) >= tda_window_size:
-        full_reference = te_snapshots[-tda_window_size:]
-    else:
-        full_reference = te_snapshots
-    embedding_full = build_asset_embedding(full_reference)
-    diagrams_full = compute_diagrams(embedding_full)
+    tda_max_dim = int(tda_cfg.get("max_dimension", 2))
+    tda_max_dim = max(1, tda_max_dim)
+
+    diagrams_full = compute_diagrams(point_cloud.full_points, maxdim=tda_max_dim)
     diagram_full_path = base_dir / "persistent_diagrams_full.png"
     save_diagram_plot(
         diagrams_full,
@@ -587,6 +600,12 @@ def main() -> None:
         "Persistence Barcodes (Full Sample)",
         barcode_full_path,
     )
+    overview_full_path = base_dir / "persistent_overview_full.png"
+    save_diagram_and_barcode(
+        diagrams_full,
+        "Persistence Diagram & Barcode (Full Sample)",
+        overview_full_path,
+    )
 
     mapper_note: Optional[str] = None
     mapper_result: Optional[Dict[str, object]] = None
@@ -598,7 +617,7 @@ def main() -> None:
 
     if mapper_enabled:
         try:
-            mapper_result = create_mapper_visualization(embedding_full, mapper_output_path, mapper_cfg)
+            mapper_result = create_mapper_visualization(point_cloud.full_points, mapper_output_path, mapper_cfg)
             backend = str(mapper_result.get("plot_backend", "plotly"))
             note = f"exported to {mapper_output_path.name}"
             if backend != "plotly":
@@ -617,69 +636,73 @@ def main() -> None:
     else:
         mapper_note = "disabled via configuration"
 
-    indices = rolling_indices(len(te_snapshots), tda_window_size, tda_window_step)
-    if not indices:
-        raise ValueError("Insufficient transfer entropy snapshots for the requested TDA window.")
-
-    metrics: List[Dict[str, float]] = []
-    bn_records: List[Dict[str, float]] = []
-    rolling_diagrams: List[Dict[str, object]] = []
+    windows = sorted(point_cloud.ensure_windows(), key=lambda item: item.index)
+    metrics: List[Dict[str, Any]] = []
+    bn_records: List[Dict[str, Any]] = []
+    window_results: List[Dict[str, Any]] = []
+    euler_records: List[Dict[str, Any]] = []
+    entropy_series: Dict[int, List[float]] = defaultdict(list)
 
     prev_diagrams: Optional[List[np.ndarray]] = None
-    window_iterator = progress_iter(indices, total=len(indices), desc="TDA rolling windows")
-    for idx, (start, end) in enumerate(window_iterator):
-        window_snapshots = te_snapshots[start:end]
-        embedding = build_asset_embedding(window_snapshots)
-        diagrams = compute_diagrams(embedding)
+    window_iterator = progress_iter(windows, total=len(windows), desc="TDA windows")
+    for window in window_iterator:
+        diagrams = compute_diagrams(window.points, maxdim=tda_max_dim)
+        window_results.append({"window": window, "diagrams": diagrams})
+        axis_value: object = window.end if window.end is not None else window.label
 
-        start_date = window_snapshots[0]["start"]
-        end_date = window_snapshots[-1]["end"]
-        label = f"{start_date.date()}_{end_date.date()}"
-        rolling_diagrams.append(
+        betti_counts: Dict[int, int] = {}
+        for dim, diagram in enumerate(diagrams):
+            summary = diagram_summary(diagram)
+            summary["label"] = window.label
+            summary["dimension"] = dim
+            summary["window_index"] = window.index
+            summary["start_date"] = window.start
+            summary["end_date"] = window.end
+            summary["axis_value"] = axis_value
+            metrics.append(summary)
+            betti_counts[dim] = summary["feature_count"]
+            entropy_series[dim].append(persistent_entropy(diagram))
+
+        euler_value = euler_characteristic(betti_counts)
+        euler_records.append(
             {
-                "index": idx,
-                "start": start_date,
-                "end": end_date,
-                "label": label,
-                "diagrams": diagrams,
+                "window_index": window.index,
+                "label": window.label,
+                "axis_value": axis_value,
+                "value": euler_value,
             }
         )
 
-        for dim, diagram in enumerate(diagrams):
-            summary = diagram_summary(diagram)
-            summary["label"] = label
-            summary["dimension"] = dim
-            summary["start_date"] = start_date
-            summary["end_date"] = end_date
-            metrics.append(summary)
-
         if prev_diagrams is not None:
-            diag_prev = finite_diagram(prev_diagrams[1])
-            diag_curr = finite_diagram(diagrams[1])
-            if diag_prev.size == 0 or diag_curr.size == 0:
-                bn_value = float("nan")
-            else:
-                bn_value = float(bottleneck(diag_prev, diag_curr))
+            bn_value = float("nan")
+            if len(prev_diagrams) > 1 and len(diagrams) > 1:
+                diag_prev = finite_diagram(prev_diagrams[1])
+                diag_curr = finite_diagram(diagrams[1])
+                if diag_prev.size != 0 and diag_curr.size != 0:
+                    bn_value = float(bottleneck(diag_prev, diag_curr))
             bn_records.append(
                 {
-                    "window_index": idx,
-                    "start_date": start_date,
-                    "end_date": end_date,
+                    "window_index": window.index,
+                    "label": window.label,
+                    "axis_value": axis_value,
                     "bottleneck_distance_h1": bn_value,
                 }
             )
         prev_diagrams = diagrams
 
-    metrics_df = pd.DataFrame(metrics).sort_values("end_date").reset_index(drop=True)
+    metrics_df = pd.DataFrame(metrics)
+    if not metrics_df.empty:
+        metrics_df = metrics_df.sort_values(["dimension", "window_index"]).reset_index(drop=True)
     metrics_path = base_dir / "tda_metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
 
     bn_df = pd.DataFrame(bn_records)
     bn_chart_path = base_dir / "bottleneck_distance.png"
     if not bn_df.empty:
-        bn_df = bn_df.sort_values("end_date").reset_index(drop=True)
+        bn_df = bn_df.sort_values("window_index").reset_index(drop=True)
+        bn_axis = prepare_axis(bn_df["axis_value"].to_list())
         save_line_chart(
-            bn_df["end_date"].to_list(),
+            bn_axis,
             {"H1": bn_df["bottleneck_distance_h1"].to_list()},
             "Rolling Bottleneck Distance (H1)",
             "Bottleneck distance",
@@ -687,42 +710,102 @@ def main() -> None:
         )
 
     betti_chart_path = base_dir / "betti_numbers.png"
+    ordered_windows = sorted(window_results, key=lambda item: item["window"].index)
+    ordered_indices = [item["window"].index for item in ordered_windows]
+    all_have_dates = all(item["window"].end is not None for item in ordered_windows)
+    axis_values = prepare_axis(
+        [item["window"].end for item in ordered_windows]
+        if all_have_dates
+        else [item["window"].label for item in ordered_windows]
+    )
+
     if not metrics_df.empty:
-        x_values = [pd.Timestamp(x) for x in sorted(metrics_df["end_date"].unique())]
-        series_map: Dict[str, List[float]] = {}
-        for dim, dim_df in metrics_df.groupby("dimension"):
-            lookup = {
-                pd.Timestamp(end): float(count)
-                for end, count in zip(dim_df["end_date"], dim_df["feature_count"])
-            }
-            series_map[f"H{dim}"] = [lookup.get(dt, float("nan")) for dt in x_values]
+        pivot = (
+            metrics_df.pivot_table(
+                index="window_index",
+                columns="dimension",
+                values="feature_count",
+                aggfunc="first",
+            )
+            .reindex(ordered_indices)
+        )
+        series_map = {
+            f"H{int(dim)}": pivot[dim].tolist()
+            for dim in sorted(pivot.columns)
+        }
         save_line_chart(
-            x_values,
+            axis_values,
             series_map,
             "Rolling Betti Numbers",
             "Feature count",
             betti_chart_path,
         )
 
-    sample_indices = sorted({0, len(rolling_diagrams) // 2, len(rolling_diagrams) - 1})
+    euler_chart_path = base_dir / "euler_characteristic.png"
+    if euler_records:
+        euler_df = pd.DataFrame(euler_records).sort_values("window_index").reset_index(drop=True)
+        euler_axis = prepare_axis(euler_df["axis_value"].to_list())
+        save_line_chart(
+            euler_axis,
+            {"Euler characteristic": euler_df["value"].to_list()},
+            "Rolling Euler Characteristic",
+            "Value",
+            euler_chart_path,
+        )
+
+    entropy_chart_path = base_dir / "persistent_entropy.png"
+    if entropy_series:
+        entropy_series_map = {
+            f"H{dim}": values
+            for dim, values in sorted(entropy_series.items())
+        }
+        save_line_chart(
+            axis_values,
+            entropy_series_map,
+            "Persistent Entropy",
+            "Entropy",
+            entropy_chart_path,
+        )
+
+    sample_indices = sorted({0, len(window_results) // 2, len(window_results) - 1})
     sample_paths: List[str] = []
     sample_barcode_paths: List[str] = []
-    for idx in sample_indices:
-        window_info = rolling_diagrams[idx]
-        title = (
-            "Persistent Diagrams ("
-            f"{window_info['start'].date()} to {window_info['end'].date()})"
-        )
-        sample_path = base_dir / f"persistent_diagrams_window_{idx + 1:03d}.png"
-        save_diagram_plot(window_info["diagrams"], title, sample_path)
-        sample_paths.append(sample_path.name)
-        barcode_title = (
-            "Persistence Barcodes ("
-            f"{window_info['start'].date()} to {window_info['end'].date()})"
-        )
-        barcode_path = base_dir / f"persistent_barcodes_window_{idx + 1:03d}.png"
-        save_barcode_plot(window_info["diagrams"], barcode_title, barcode_path)
-        sample_barcode_paths.append(barcode_path.name)
+    sample_overview_paths: List[str] = []
+    if sample_indices and window_results:
+        for pos in sample_indices:
+            window_data = window_results[pos]
+            window = window_data["window"]
+            diagrams = window_data["diagrams"]
+            suffix = f"{pos + 1:03d}"
+            if window.start is not None and window.end is not None:
+                diag_title = (
+                    "Persistent Diagrams ("
+                    f"{window.start.date()} to {window.end.date()})"
+                )
+                barcode_title = (
+                    "Persistence Barcodes ("
+                    f"{window.start.date()} to {window.end.date()})"
+                )
+                overview_title = (
+                    "Diagram & Barcode ("
+                    f"{window.start.date()} to {window.end.date()})"
+                )
+            else:
+                diag_title = f"Persistent Diagrams ({window.label})"
+                barcode_title = f"Persistence Barcodes ({window.label})"
+                overview_title = f"Diagram & Barcode ({window.label})"
+
+            sample_path = base_dir / f"persistent_diagrams_window_{suffix}.png"
+            save_diagram_plot(diagrams, diag_title, sample_path)
+            sample_paths.append(sample_path.name)
+
+            barcode_path = base_dir / f"persistent_barcodes_window_{suffix}.png"
+            save_barcode_plot(diagrams, barcode_title, barcode_path)
+            sample_barcode_paths.append(barcode_path.name)
+
+            overview_path = base_dir / f"persistent_overview_window_{suffix}.png"
+            save_diagram_and_barcode(diagrams, overview_title, overview_path)
+            sample_overview_paths.append(overview_path.name)
 
     bn_stats = {
         "mean": float(bn_df["bottleneck_distance_h1"].mean())
@@ -737,49 +820,76 @@ def main() -> None:
     }
 
     betti_summary: Dict[int, Dict[str, float]] = {}
-    for dim, dim_df in metrics_df.groupby("dimension"):
-        if dim_df.empty:
-            betti_summary[dim] = {"mean": float("nan"), "max": float("nan"), "min": float("nan")}
+    if not metrics_df.empty and "dimension" in metrics_df.columns:
+        for dim, dim_df in metrics_df.groupby("dimension"):
+            if dim_df.empty:
+                betti_summary[dim] = {"mean": float("nan"), "max": float("nan"), "min": float("nan")}
+            else:
+                betti_summary[dim] = {
+                    "mean": float(dim_df["feature_count"].mean()),
+                    "max": float(dim_df["feature_count"].max()),
+                    "min": float(dim_df["feature_count"].min()),
+                }
+
+    if euler_records:
+        euler_array = np.asarray([rec["value"] for rec in euler_records], dtype=float)
+        euler_stats = {
+            "mean": float(np.nanmean(euler_array)),
+            "max": float(np.nanmax(euler_array)),
+            "min": float(np.nanmin(euler_array)),
+        }
+    else:
+        euler_stats = None
+
+    entropy_summary: Dict[int, Dict[str, float]] = {}
+    for dim, values in entropy_series.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            entropy_summary[dim] = {"mean": float("nan"), "max": float("nan"), "min": float("nan")}
         else:
-            betti_summary[dim] = {
-                "mean": float(dim_df["feature_count"].mean()),
-                "max": float(dim_df["feature_count"].max()),
-                "min": float(dim_df["feature_count"].min()),
+            entropy_summary[dim] = {
+                "mean": float(np.nanmean(arr)),
+                "max": float(np.nanmax(arr)),
+                "min": float(np.nanmin(arr)),
             }
 
     summary_path = base_dir / "tda_summary.md"
     write_summary(
         summary_path,
-        len(df),
-        df.shape[1],
-        te_window_size,
-        te_step,
-        len(te_snapshots),
-        tda_window_size,
-        tda_window_step,
-        len(indices),
-        te_history,
-        te_bins,
-        te_stats,
-        te_top_pairs,
-        bn_stats,
-        betti_summary,
-        mapper_note,
+        observations=len(df),
+        assets=df.shape[1],
+        point_cloud_method=point_cloud.method,
+        point_cloud_summary=point_cloud.summary_lines,
+        tda_config={
+            "window_size": int(tda_cfg.get("window_size", len(windows))),
+            "step": int(tda_cfg.get("step", 1)),
+        },
+        tda_window_count=len(windows),
+        bn_stats=bn_stats,
+        betti_stats=betti_summary,
+        euler_stats=euler_stats,
+        entropy_stats=entropy_summary,
+        mapper_note=mapper_note,
     )
 
     output_files = [
         diagram_full_path.name,
         barcode_full_path.name,
+        overview_full_path.name,
         *sample_paths,
         *sample_barcode_paths,
+        *sample_overview_paths,
     ]
-    if te_csv_path.exists():
-        output_files.append(te_csv_path.name)
     if bn_chart_path.exists():
         output_files.append(bn_chart_path.name)
     if betti_chart_path.exists():
         output_files.append(betti_chart_path.name)
+    if euler_chart_path.exists():
+        output_files.append(euler_chart_path.name)
+    if entropy_chart_path.exists():
+        output_files.append(entropy_chart_path.name)
     output_files.extend(["tda_metrics.csv", "tda_summary.md"])
+    output_files.extend(point_cloud.output_files)
     if mapper_result:
         output_files.append(mapper_output_path.name)
 
@@ -789,24 +899,24 @@ def main() -> None:
         "assets": int(df.shape[1]),
         "config": {
             "config_path": str(args.config),
-            "transfer_entropy": {
-                "window_size": te_window_size,
-                "step": te_step,
-                "history": te_history,
-                "bins": te_bins,
-            },
             "tda": {
-                "window_size": tda_window_size,
-                "step": tda_window_step,
+                "window_size": int(tda_cfg.get("window_size", len(windows))),
+                "step": int(tda_cfg.get("step", 1)),
+                "max_dimension": tda_max_dim,
             },
         },
-        "transfer_entropy": {
-            "snapshots": len(te_snapshots),
-            "statistics": te_stats,
-            "top_pairs": te_top_pairs,
+        "point_cloud": {
+            "method": point_cloud.method,
+            "summary": point_cloud.summary_lines,
+            "metadata": point_cloud.metadata,
+            "output_files": point_cloud.output_files,
         },
-        "tda_window": {
-            "count": len(indices),
+        "tda": {
+            "windows": len(windows),
+            "bottleneck": bn_stats,
+            "betti": betti_summary,
+            "euler": euler_stats,
+            "entropy": entropy_summary,
         },
         "output_files": output_files,
     }
