@@ -2,12 +2,12 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from persim import bottleneck, plot_diagrams
+from persim import bottleneck, plot_diagrams, heat
 from ripser import ripser
 from sklearn.cluster import AgglomerativeClustering, DBSCAN
 from sklearn.decomposition import PCA
@@ -15,6 +15,7 @@ from sklearn.decomposition import PCA
 from point_clouds import PointCloudResult
 from pca_point_cloud import create_pca_point_cloud
 from transfer_entropy_point_cloud import create_transfer_entropy_point_cloud
+from umap_point_cloud import create_umap_point_cloud
 
 try:
     import yaml
@@ -71,6 +72,16 @@ def progress_iter(iterable: Iterable, total: Optional[int] = None, desc: str = "
                 print(f"{prefix}{count}")
 
     return generator()
+
+
+def rolling_indices(length: int, window_size: int, step: int) -> List[Tuple[int, int]]:
+    if length < window_size or window_size <= 0 or step <= 0:
+        return []
+    windows: List[Tuple[int, int]] = []
+    for start in range(0, length - window_size + 1, step):
+        end = start + window_size
+        windows.append((start, end))
+    return windows
 
 
 def compute_diagrams(point_cloud: np.ndarray, maxdim: int = 1) -> List[np.ndarray]:
@@ -146,6 +157,8 @@ def save_barcode_plot(diagrams: List[np.ndarray], title: str, output_path: Path)
     axes[0].set_title(title)
     if max_end > 0:
         axes[-1].set_xlim(left=0, right=max_end * 1.05)
+    else:
+        axes[-1].set_xlim(left=0, right=1.0)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
@@ -171,18 +184,21 @@ def save_diagram_and_barcode(
         if finite.size:
             max_limit = max(max_limit, float(np.max(finite)))
 
-    if max_limit == 0:
+    if max_limit <= 0:
         max_limit = 1.0
 
     for dim, (diagram, row_axes) in enumerate(zip(diagrams, axes)):
         diag_ax, bar_ax = row_axes
-        plot_diagrams([diagram], show=False, ax=diag_ax)
-        diag_ax.set_title(f"H{dim} Persistence Diagram")
+        finite = finite_diagram(diagram)
+        if finite.size == 0:
+            diag_ax.text(0.5, 0.5, "No finite features", ha="center", va="center", fontsize=10)
+        else:
+            plot_diagrams([diagram], show=False, ax=diag_ax)
         diag_ax.set_xlim(0, max_limit * 1.05)
         diag_ax.set_ylim(0, max_limit * 1.05)
+        diag_ax.set_title(f"H{dim} Persistence Diagram")
         diag_ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4)
 
-        finite = finite_diagram(diagram)
         if finite.size == 0:
             bar_ax.text(0.5, 0.5, "No finite features", ha="center", va="center", fontsize=10)
             bar_ax.set_ylim(-0.5, 0.5)
@@ -190,7 +206,7 @@ def save_diagram_and_barcode(
             for idx, (birth, death) in enumerate(sorted(finite, key=lambda pair: pair[0])):
                 bar_ax.hlines(idx, birth, death, colors="tab:blue", linewidth=2)
             bar_ax.set_ylim(-0.5, len(finite) - 0.5)
-            bar_ax.set_xlim(0, max_limit * 1.05)
+        bar_ax.set_xlim(0, max_limit * 1.05)
         bar_ax.set_title(f"H{dim} Barcode")
         bar_ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4)
         if dim == dims - 1:
@@ -275,11 +291,11 @@ def build_point_cloud(
 ) -> PointCloudResult:
     point_cfg = config.get("point_cloud", {}) or {}
     method = str(point_cfg.get("method", "transfer_entropy")).lower()
+    tda_cfg = config.get("tda", {}) or {}
 
     if method == "transfer_entropy":
         data_cfg = config.get("data", {}) or {}
         te_cfg = config.get("transfer_entropy", {}) or {}
-        tda_cfg = config.get("tda", {}) or {}
         return create_transfer_entropy_point_cloud(
             base_dir=base_dir,
             returns=returns,
@@ -295,8 +311,16 @@ def build_point_cloud(
             returns=returns,
             pca_cfg=pca_cfg,
         )
+    if method == "umap":
+        umap_cfg = config.get("umap", {}) or {}
+        return create_umap_point_cloud(
+            base_dir=base_dir,
+            returns=returns,
+            umap_cfg=umap_cfg,
+            tda_cfg=tda_cfg,
+        )
 
-    available = ["transfer_entropy", "pca"]
+    available = ["transfer_entropy", "pca", "umap"]
     raise ValueError(
         "Unknown point cloud method '"
         f"{method}' specified. Supported methods: {', '.join(available)}."
@@ -486,6 +510,7 @@ def write_summary(
     tda_config: Dict[str, int],
     tda_window_count: int,
     bn_stats: Dict[str, float],
+    diffusion_stats: Dict[str, float],
     betti_stats: Dict[int, Dict[str, float]],
     euler_stats: Optional[Dict[str, float]],
     entropy_stats: Dict[int, Dict[str, float]],
@@ -515,6 +540,14 @@ def write_summary(
         lines.append(
             "- Rolling bottleneck distance (H1): "
             f"mean {bn_stats['mean']:.4f}, max {bn_stats['max']:.4f}, min {bn_stats['min']:.4f}"
+        )
+
+    if np.isnan(diffusion_stats.get("mean", float("nan"))):
+        lines.append("- Rolling diffusion distance (H1): not available")
+    else:
+        lines.append(
+            "- Rolling diffusion distance (H1): "
+            f"mean {diffusion_stats['mean']:.4f}, max {diffusion_stats['max']:.4f}, min {diffusion_stats['min']:.4f}"
         )
 
     for dim, stats in sorted(betti_stats.items()):
@@ -675,17 +708,23 @@ def main() -> None:
 
         if prev_diagrams is not None:
             bn_value = float("nan")
+            diffusion_value = float("nan")
             if len(prev_diagrams) > 1 and len(diagrams) > 1:
                 diag_prev = finite_diagram(prev_diagrams[1])
                 diag_curr = finite_diagram(diagrams[1])
                 if diag_prev.size != 0 and diag_curr.size != 0:
                     bn_value = float(bottleneck(diag_prev, diag_curr))
+                    try:
+                        diffusion_value = float(heat(diag_prev, diag_curr))
+                    except Exception:  # pragma: no cover - robustness for numerical issues
+                        diffusion_value = float("nan")
             bn_records.append(
                 {
                     "window_index": window.index,
                     "label": window.label,
                     "axis_value": axis_value,
                     "bottleneck_distance_h1": bn_value,
+                    "diffusion_distance_h1": diffusion_value,
                 }
             )
         prev_diagrams = diagrams
@@ -708,6 +747,49 @@ def main() -> None:
             "Bottleneck distance",
             bn_chart_path,
         )
+    else:
+        if window_results:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.text(
+                0.5,
+                0.5,
+                "Bottleneck distance requires at least two windows",
+                ha="center",
+                va="center",
+                fontsize=11,
+            )
+            ax.set_axis_off()
+            fig.suptitle("Rolling Bottleneck Distance (H1)")
+            fig.tight_layout()
+            fig.savefig(bn_chart_path, dpi=300)
+            plt.close(fig)
+
+    diffusion_chart_path = base_dir / "diffusion_distance.png"
+    if not bn_df.empty and "diffusion_distance_h1" in bn_df:
+        diffusion_axis = prepare_axis(bn_df["axis_value"].to_list())
+        save_line_chart(
+            diffusion_axis,
+            {"H1": bn_df["diffusion_distance_h1"].to_list()},
+            "Rolling Diffusion Distance (H1)",
+            "Diffusion distance",
+            diffusion_chart_path,
+        )
+    else:
+        if window_results:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.text(
+                0.5,
+                0.5,
+                "Diffusion distance requires at least two windows",
+                ha="center",
+                va="center",
+                fontsize=11,
+            )
+            ax.set_axis_off()
+            fig.suptitle("Rolling Diffusion Distance (H1)")
+            fig.tight_layout()
+            fig.savefig(diffusion_chart_path, dpi=300)
+            plt.close(fig)
 
     betti_chart_path = base_dir / "betti_numbers.png"
     ordered_windows = sorted(window_results, key=lambda item: item["window"].index)
@@ -767,45 +849,44 @@ def main() -> None:
             entropy_chart_path,
         )
 
-    sample_indices = sorted({0, len(window_results) // 2, len(window_results) - 1})
     sample_paths: List[str] = []
     sample_barcode_paths: List[str] = []
     sample_overview_paths: List[str] = []
-    if sample_indices and window_results:
-        for pos in sample_indices:
-            window_data = window_results[pos]
-            window = window_data["window"]
-            diagrams = window_data["diagrams"]
-            suffix = f"{pos + 1:03d}"
-            if window.start is not None and window.end is not None:
-                diag_title = (
-                    "Persistent Diagrams ("
-                    f"{window.start.date()} to {window.end.date()})"
-                )
-                barcode_title = (
-                    "Persistence Barcodes ("
-                    f"{window.start.date()} to {window.end.date()})"
-                )
-                overview_title = (
-                    "Diagram & Barcode ("
-                    f"{window.start.date()} to {window.end.date()})"
-                )
-            else:
-                diag_title = f"Persistent Diagrams ({window.label})"
-                barcode_title = f"Persistence Barcodes ({window.label})"
-                overview_title = f"Diagram & Barcode ({window.label})"
+    if window_results:
+        latest_index = window_results[-1]["window"].index
+        window_data = window_results[-1]
+        window = window_data["window"]
+        diagrams = window_data["diagrams"]
+        suffix = f"{latest_index + 1:03d}"
+        if window.start is not None and window.end is not None:
+            diag_title = (
+                "Persistent Diagrams ("
+                f"{window.start.date()} to {window.end.date()})"
+            )
+            barcode_title = (
+                "Persistence Barcodes ("
+                f"{window.start.date()} to {window.end.date()})"
+            )
+            overview_title = (
+                "Diagram & Barcode ("
+                f"{window.start.date()} to {window.end.date()})"
+            )
+        else:
+            diag_title = f"Persistent Diagrams ({window.label})"
+            barcode_title = f"Persistence Barcodes ({window.label})"
+            overview_title = f"Diagram & Barcode ({window.label})"
 
-            sample_path = base_dir / f"persistent_diagrams_window_{suffix}.png"
-            save_diagram_plot(diagrams, diag_title, sample_path)
-            sample_paths.append(sample_path.name)
+        sample_path = base_dir / f"persistent_diagrams_window_{suffix}.png"
+        save_diagram_plot(diagrams, diag_title, sample_path)
+        sample_paths.append(sample_path.name)
 
-            barcode_path = base_dir / f"persistent_barcodes_window_{suffix}.png"
-            save_barcode_plot(diagrams, barcode_title, barcode_path)
-            sample_barcode_paths.append(barcode_path.name)
+        barcode_path = base_dir / f"persistent_barcodes_window_{suffix}.png"
+        save_barcode_plot(diagrams, barcode_title, barcode_path)
+        sample_barcode_paths.append(barcode_path.name)
 
-            overview_path = base_dir / f"persistent_overview_window_{suffix}.png"
-            save_diagram_and_barcode(diagrams, overview_title, overview_path)
-            sample_overview_paths.append(overview_path.name)
+        overview_path = base_dir / f"persistent_overview_window_{suffix}.png"
+        save_diagram_and_barcode(diagrams, overview_title, overview_path)
+        sample_overview_paths.append(overview_path.name)
 
     bn_stats = {
         "mean": float(bn_df["bottleneck_distance_h1"].mean())
@@ -818,6 +899,20 @@ def main() -> None:
         if not bn_df.empty
         else float("nan"),
     }
+
+    if not bn_df.empty and "diffusion_distance_h1" in bn_df:
+        diffusion_series = bn_df["diffusion_distance_h1"]
+        diffusion_stats = {
+            "mean": float(diffusion_series.mean()),
+            "max": float(diffusion_series.max()),
+            "min": float(diffusion_series.min()),
+        }
+    else:
+        diffusion_stats = {
+            "mean": float("nan"),
+            "max": float("nan"),
+            "min": float("nan"),
+        }
 
     betti_summary: Dict[int, Dict[str, float]] = {}
     if not metrics_df.empty and "dimension" in metrics_df.columns:
@@ -866,6 +961,7 @@ def main() -> None:
         },
         tda_window_count=len(windows),
         bn_stats=bn_stats,
+        diffusion_stats=diffusion_stats,
         betti_stats=betti_summary,
         euler_stats=euler_stats,
         entropy_stats=entropy_summary,
@@ -882,6 +978,8 @@ def main() -> None:
     ]
     if bn_chart_path.exists():
         output_files.append(bn_chart_path.name)
+    if diffusion_chart_path.exists():
+        output_files.append(diffusion_chart_path.name)
     if betti_chart_path.exists():
         output_files.append(betti_chart_path.name)
     if euler_chart_path.exists():
@@ -914,6 +1012,7 @@ def main() -> None:
         "tda": {
             "windows": len(windows),
             "bottleneck": bn_stats,
+            "diffusion": diffusion_stats,
             "betti": betti_summary,
             "euler": euler_stats,
             "entropy": entropy_summary,

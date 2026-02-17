@@ -1,24 +1,28 @@
 # Topological Data Analysis Summary
-- Observations processed: 547
+- Observations processed: 554
 - Assets included: 161
-- Transfer entropy window (trading days): 40
-- Transfer entropy sampling step (days): 1
-- Transfer entropy snapshots ingested: 508
-- TDA window size (snapshots): 25
-- TDA window step (snapshots): 5
-- TDA windows evaluated: 97
-- Transfer entropy history length (k): 1
-- Transfer entropy discretization bins: 12
-- Symmetric transfer entropy (global): mean 1.3270, max 1.7959, min 0.4203
-- Strongest average TE pairs:
-  - 002716 CH Equity <-> 9988 HK Equity: 1.4581
-  - 600862 CH Equity <-> 9988 HK Equity: 1.4455
-  - 002179 CH Equity <-> 9988 HK Equity: 1.4448
-  - 9988 HK Equity <-> 002085 CH Equity: 1.4396
-  - 9988 HK Equity <-> 000423 CH Equity: 1.4384
-- Rolling bottleneck distance (H1): mean 0.2670, max 0.6926, min 0.1522
+- Point cloud method: umap
+- TDA window size: 25
+- TDA window step: 5
+- TDA windows evaluated: 106
+- Point cloud details:
+  Components: 3
+  Neighbors: 15
+  Min dist: 0.1
+  Metric: euclidean
+  TDA window size: 25
+  TDA step: 5
+  Random state: 42
+- Rolling bottleneck distance (H1): mean 0.1388, max 0.3450, min 0.0683
+- Rolling diffusion distance (H1): mean 0.1713, max 0.5716, min 0.0163
 - Betti numbers (H0): mean 160.00, max 160, min 160
-- Betti numbers (H1): mean 108.32, max 150, min 64
-- Mapper visualisation: exported to mapper_graph.html (144 nodes)
+- Betti numbers (H1): mean 50.60, max 70, min 38
+- Betti numbers (H2): mean 7.10, max 15, min 0
+- Euler characteristic: mean 116.50, max 125.00, min 98.00
+- Persistent entropy:
+  H0: mean 4.9982, max 5.0237, min 4.9735
+  H1: mean 3.4900, max 3.8582, min 3.1534
+  H2: mean 1.5053, max 2.3235, min 0.0000
+- Mapper visualisation: exported to mapper_graph.html (43 nodes)
 
 Betti numbers represent the count of topological features (components, loops, etc.) detected within each rolling window's persistent homology diagrams.

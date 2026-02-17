@@ -8,6 +8,17 @@ transfer_entropy:
   history: 1              # number of lags for TE estimation
   bins: 12                # discretization bins for TE
 
+point_cloud:
+  method: umap
+
+umap:
+  n_components: 3
+  n_neighbors: 15
+  min_dist: 0.1
+  metric: euclidean
+  random_state: 42
+  spread: 1.0
+
 tda:
   window_size: 25         # number of TE snapshots per TDA window
   step: 5                 # stride between TDA windows

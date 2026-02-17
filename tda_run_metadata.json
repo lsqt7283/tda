@@ -1,59 +1,125 @@
 {
-  "observations": 547,
+  "observations": 554,
   "assets": 161,
   "config": {
-    "config_path": "\\\\LSFS\\BOSTON\\Dept\\FIM\\HF2\\PY\\EM Model\\NLP\\TDA\\tda_config.yaml",
-    "transfer_entropy": {
-      "window_size": 40,
-      "step": 1,
-      "history": 1,
-      "bins": 12
-    },
+    "config_path": "NLP\\TDA\\tda_config.yaml",
     "tda": {
       "window_size": 25,
-      "step": 5
+      "step": 5,
+      "max_dimension": 2
     }
   },
-  "transfer_entropy": {
-    "snapshots": 508,
-    "statistics": {
-      "mean": 1.3270145383441059,
-      "max": 1.7958743594181472,
-      "min": 0.4203242619270935
+  "point_cloud": {
+    "method": "umap",
+    "summary": [
+      "Components: 3",
+      "Neighbors: 15",
+      "Min dist: 0.1",
+      "Metric: euclidean",
+      "TDA window size: 25",
+      "TDA step: 5",
+      "Random state: 42"
+    ],
+    "metadata": {
+      "n_components": 3,
+      "n_neighbors": 15,
+      "min_dist": 0.1,
+      "metric": "euclidean",
+      "spread": 1.0,
+      "random_state": 42,
+      "window_size": 25,
+      "step": 5,
+      "windows": 106
     },
-    "top_pairs": [
-      "002716 CH Equity <-> 9988 HK Equity: 1.4581",
-      "600862 CH Equity <-> 9988 HK Equity: 1.4455",
-      "002179 CH Equity <-> 9988 HK Equity: 1.4448",
-      "9988 HK Equity <-> 002085 CH Equity: 1.4396",
-      "9988 HK Equity <-> 000423 CH Equity: 1.4384"
+    "output_files": [
+      "umap_embedding.csv",
+      "umap_embedding_distances.csv",
+      "umap_nearest_neighbors.txt",
+      "umap_embedding.png",
+      "umap_embedding_1_3.png",
+      "umap_embedding_2_3.png"
     ]
   },
-  "tda_window": {
-    "count": 97
+  "tda": {
+    "windows": 106,
+    "bottleneck": {
+      "mean": 0.13877086071741013,
+      "max": 0.3449684679508209,
+      "min": 0.06831017136573792
+    },
+    "diffusion": {
+      "mean": 0.17129075153515783,
+      "max": 0.5716289447454854,
+      "min": 0.016330293689589544
+    },
+    "betti": {
+      "0": {
+        "mean": 160.0,
+        "max": 160.0,
+        "min": 160.0
+      },
+      "1": {
+        "mean": 50.60377358490566,
+        "max": 70.0,
+        "min": 38.0
+      },
+      "2": {
+        "mean": 7.10377358490566,
+        "max": 15.0,
+        "min": 0.0
+      }
+    },
+    "euler": {
+      "mean": 116.5,
+      "max": 125.0,
+      "min": 98.0
+    },
+    "entropy": {
+      "0": {
+        "mean": 4.998247125944503,
+        "max": 5.023664853725358,
+        "min": 4.9734932571178
+      },
+      "1": {
+        "mean": 3.4900194034974277,
+        "max": 3.8581822348600676,
+        "min": 3.15339678648139
+      },
+      "2": {
+        "mean": 1.5053023907694274,
+        "max": 2.32353203655283,
+        "min": 0.0
+      }
+    }
   },
   "output_files": [
     "persistent_diagrams_full.png",
     "persistent_barcodes_full.png",
-    "persistent_diagrams_window_001.png",
-    "persistent_diagrams_window_049.png",
-    "persistent_diagrams_window_097.png",
-    "persistent_barcodes_window_001.png",
-    "persistent_barcodes_window_049.png",
-    "persistent_barcodes_window_097.png",
-    "transfer_entropy_snapshots.csv",
+    "persistent_overview_full.png",
+    "persistent_diagrams_window_106.png",
+    "persistent_barcodes_window_106.png",
+    "persistent_overview_window_106.png",
     "bottleneck_distance.png",
+    "diffusion_distance.png",
     "betti_numbers.png",
+    "euler_characteristic.png",
+    "persistent_entropy.png",
     "tda_metrics.csv",
     "tda_summary.md",
+    "umap_embedding.csv",
+    "umap_embedding_distances.csv",
+    "umap_nearest_neighbors.txt",
+    "umap_embedding.png",
+    "umap_embedding_1_3.png",
+    "umap_embedding_2_3.png",
     "mapper_graph.html"
   ],
   "mapper": {
     "enabled": true,
-    "note": "exported to mapper_graph.html (144 nodes)",
+    "note": "exported to mapper_graph.html (43 nodes)",
     "result": {
-      "nodes": 144,
-      "edges": 136,
+      "nodes": 43,
+      "edges": 50,
       "lens_components": 2,
       "intervals": 12,
       "intervals_requested": [
@@ -71,8 +137,9 @@
       "plot_backend_error": null,
       "cover_fallback": "scalar_intervals",
       "cluster_strategy": {
-        "algorithm": "AgglomerativeClustering",
-        "n_clusters": 8
+        "algorithm": "DBSCAN",
+        "eps": 0.5,
+        "min_samples": 3
       }
     },
     "output_html": "mapper_graph.html"
